@@ -1,0 +1,290 @@
+import warnings
+warnings.filterwarnings('ignore')
+from google.cloud import bigquery
+from google.oauth2 import service_account
+import os
+from io import StringIO
+from dateutil import parser
+from datetime import datetime
+from datetime import date
+import pandas as pd
+import numpy as np
+import string
+import requests
+
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'cl_gcs_credentials.json'
+gbq_project_id = 'tough-cascade-359115'
+gbq_transformed_reviews_data = 'transformed_reviews_data'
+gbq_master_asins_table = 'master_asins_table'
+gbq_master_asins_table_location = '{}.{}'.format(gbq_transformed_reviews_data, gbq_master_asins_table)
+credentials = service_account.Credentials.from_service_account_file('cl_gcs_credentials.json')
+client = bigquery.Client(credentials=credentials, project=gbq_project_id)
+
+###################################################################################################################
+
+def main():
+    def getMasterASINS(auto_search_term_list):
+
+        # Setting the AutoComplete Looping Parameters & Response Data Manipulation
+        def auto_complete(auto_search_term):
+
+            # set up the request parameters
+            auto_params = {
+                'api_key': 'A851E5CEDC634F0A9DEBCF4CF62F33B5',
+                'type': 'autocomplete',
+                'amazon_domain': 'amazon.com',
+                'search_term': auto_search_term,
+            }
+
+            # make the http GET request to Rainforest API
+            auto_api_result = requests.get('https://api.rainforestapi.com/request', auto_params)
+
+            # auto complete
+            auto_response = auto_api_result.json()
+            
+            # Need to include --> if auto_response["autocomplete_results"] = True / Exists
+            auto_suggestion = [x["suggestion"] for x in auto_response["autocomplete_results"]]
+
+            return auto_suggestion
+
+        print(prompt_list)
+        # STARTING THE AUTOCOMPLETE LOOPING
+        search_term_list = []
+        for search_term in auto_search_term_list:
+            search_term_list.extend(auto_complete(search_term))
+
+        # remove duplicates
+        search_term_list = list(set(search_term_list))
+
+
+        # SEARCH TERM SCRIPT
+        def search(search_term_list):
+            # set up the request parameters
+            df_search = []
+            count_search_requests = 0
+            for a,search in enumerate(search_term_list):
+                search_params = {
+                    'api_key': 'A851E5CEDC634F0A9DEBCF4CF62F33B5',
+                    'type': 'search',
+                    'amazon_domain': 'amazon.com',
+                    'search_term': search,
+                    'sort_by': 'featured',
+                    'exclude_sponsored': 'true',
+                    'language': 'en_US',
+                    'currency': 'usd',
+                    'page': '1',
+                    'max_page': '1',
+                    'output': 'csv',
+                    'csv_fields': 'search_results.asin,search_results.title,search_results.price.value,search_results.rating,search_results.ratings_total,search_results.link,request.search_term,search_results.page'
+                }
+                
+                print("Searching:", search, end="\r")
+                # make the http GET request to Rainforest API
+                search_api_result = requests.get('https://api.rainforestapi.com/request', search_params)
+                search_data = StringIO(str(search_api_result.content,'utf-8'))
+                df_current_search = pd.read_csv(search_data)
+                df_search.append(df_current_search)
+                
+                
+                count_search_requests += 1
+                if count_search_requests >= 1:
+                    break
+
+            return pd.concat(df_search)
+
+
+        # Start Search Term Loop
+        df_search = search(search_term_list=search_term_list)
+
+
+        # CLEANING INITIAL SEARCH DATA
+        # Eventually can create big function with this inside of it
+        df_search = df_search.drop_duplicates(subset=['search_results.asin'])
+        df_search = df_search.reset_index(drop=True)
+        df_master_asins_list = pd.read_gbq('SELECT ASIN FROM `{}` LIMIT 1000000'.format(gbq_master_asins_table_location), project_id=gbq_project_id)
+        asin_cond = df_search['search_results.asin'].isin(df_master_asins_list['ASIN'])
+        df_search.drop(df_search[asin_cond].index, inplace=True)
+        df_search = df_search.reset_index(drop=True)
+
+        # Cleaning Search Data & Producing new Columns
+        df_search = df_search.rename(columns=lambda s: s.replace(".", "_"))
+        df_search = df_search[df_search.search_results_ratings_total.notnull()]
+        df_search = df_search[df_search.search_results_ratings_total > 10]
+        df_search.rename(columns = {'search_results_asin' : 'ASIN', 'search_results_title' : 'asin_title', 'search_results_price_value' : 'asin_price_usd', 'search_results_rating' : 'asin_avg_rating', 'search_results_ratings_total' : 'asin_total_ratings', 'search_results_link' : 'asin_url','request_parameters_search_term' : 'asin_search_term', 'search_results_page' : 'asin_search_term_pagerank'}, inplace = True)
+        df_search = df_search.reset_index(drop=True)
+
+        df_search["asin_score"] = round(df_search["asin_avg_rating"]*df_search["asin_total_ratings"]/100, 2)
+        df_search = df_search[df_search.asin_score >= 2]
+        df_search = df_search.reset_index(drop=True)
+
+        # Removing any row that Price = 0, and setting price ranges
+        def map_range(price):
+            if price > 81:
+                return "High Ticket"
+            elif price > 51:
+                return "Big Ticket"
+            elif price > 21:
+                return "Mid Ticket"
+            elif price > 1:
+                return "Low Ticket"
+            else:
+                return 0
+                
+        df_search["asin_price_range"] = df_search["asin_price_usd"].apply(map_range)
+
+        # Dropping rows where Price = 0 or NaN
+        df_search = df_search[df_search.asin_price_range != 0]
+        df_search = df_search.reset_index(drop=True)
+
+        # Sorting by ASIN Score (Highest to Lowest)
+        df_search = df_search.sort_values(by='asin_score', ascending=False)
+        df_search = df_search.reset_index(drop=True)
+        df_search = df_search.fillna(0)
+
+
+        # PRODUCT DATA LOOPING SCRIPT
+        def getASIN(list_asins):
+            # set up the request parameters
+            df_asins = []
+            count_asins_requests = 0
+            for b, asin in enumerate(list_asins):
+                asin_params = {
+                    'api_key': 'A851E5CEDC634F0A9DEBCF4CF62F33B5',
+                    'amazon_domain': 'amazon.com',
+                    'asin': asin,
+                    'type': 'product',
+                    'include_summarization_attributes': 'false',
+                    'include_a_plus_body': 'false',
+                    'language': 'en_US',
+                    'currency': 'usd',
+                    'output': 'csv',
+                    'csv_fields': 'product.brand,product.dimensions,product.asin,product.description,product.categories_flat,product.images_flat,product.videos_flat,product.first_available.raw,product.feature_bullets_flat,product.specifications_flat,product.variant_asins_flat'
+                }
+                
+                print("Running Product Request Number:", b+1, "for ASIN:", asin, end="\r")
+                # make the http GET request to Rainforest API
+                product_api_result = requests.get('https://api.rainforestapi.com/request', asin_params)
+                product_data = StringIO(str(product_api_result.content,'utf-8'))
+                asin_output = pd.read_csv(product_data)
+                df_asins.append(asin_output)
+                
+                
+                count_asins_requests += 1
+                if count_asins_requests > 2:
+                    break
+
+            return pd.concat(df_asins)
+
+
+        # CLEANING THE PRODUCT DATA & MERGING WITH SEARCH DATA
+        # Only taking 3 for this test - remove df_ranked_asins_slice for full automation - (if using limitation - must match limitation from cell below)
+        df_search_slice = df_search[(df_search['asin_total_ratings']<=90000)]
+        df_ranked_asins = df_search_slice['ASIN'].head(24)
+        list_asins = list(df_ranked_asins)
+        df_asins = getASIN(list_asins=list_asins)
+
+
+        # Reindexing for newly combined & created Data Points / Columns
+        df_product = df_asins.reset_index(drop=True)
+        df_product = df_product.rename(columns=lambda s: s.replace(".", "_"))
+        df_product['product_description'] = df_product['product_description'].replace('\n', ' ', regex=True)
+        df_product['product_feature_bullets_flat'] = df_product['product_feature_bullets_flat'].replace('\n', ' ', regex=True)
+        df_product = df_product.fillna('')
+        df_product.rename(columns = {'product_brand' : 'asin_brand', 'product_dimensions' : 'asin_dimensions', 'product_asin' : 'ASIN', 'product_description' : 'asin_description', 'product_categories_flat' : 'asin_category', 'product_images_flat' : 'asin_image_urls','product_videos_flat' : 'asin_video_urls', 'product_first_available_raw' : 'asin_launch_date', 'product_feature_bullets_flat' : 'asin_bullets', 'product_specifications_flat' : 'asin_details', 'product_variant_asins_flat' : 'asin_variants'}, inplace = True)
+        df_product['asin_copywriting'] = str(df_product['asin_bullets']) + ' ' + df_product['asin_description']
+        df_product = df_product.drop(['asin_bullets', 'asin_description'], axis=1)
+        df_product = df_product.reset_index(drop=True)
+
+        # Merging to create master asins table / dataframe
+        # Only taking 3 for this test - remove df_master_asins_slice for full automation - (if using limitation - must match limitation from cell above)
+        df_master_asins_slice = df_search_slice.head(24)
+        df_master_asins = pd.merge(df_master_asins_slice, df_product, on='ASIN')
+
+        # Creating sales estimation columns / data points
+        launch_date = pd.to_datetime(df_master_asins['asin_launch_date'], errors='coerce')
+        current_date = pd.to_datetime(date.today())
+        diff_days = (current_date - launch_date) / np.timedelta64(1, 'D')
+        df_master_asins['asin_daily_sales_frequency'] = round((df_master_asins['asin_total_ratings'] / diff_days), 0)
+        df_product = df_product.fillna('')
+        df_product = df_product.reset_index(drop=True)
+
+        # SETTING ASIN LAUNCH DATE COLUMN AS DATETIME DTYPE
+        for d, dates in enumerate(df_master_asins['asin_launch_date']):
+            ldate = df_master_asins.iloc[d]['asin_launch_date']
+            if ldate != '':
+                df_master_asins['asin_launch_date'][d] = pd.to_datetime(parser.parse(ldate, fuzzy=True).date())
+            else:
+                df_master_asins['asin_launch_date'][d] = ''
+
+        # FINAL CLEANING / STANDARDIZATION OF COLUMN DTYPES
+        df_master_asins['asin_search_term'] = df_master_asins.asin_search_term.astype(str)
+        df_master_asins['asin_search_term_pagerank'] = df_master_asins.asin_search_term_pagerank.replace('',np.nan).astype(float)
+        df_master_asins['asin_total_ratings'] = df_master_asins.asin_total_ratings.replace('',np.nan).astype(float)
+        df_master_asins['asin_avg_rating'] = df_master_asins.asin_avg_rating.replace('',np.nan).astype(float)
+        df_master_asins['asin_score'] = df_master_asins.asin_score.replace('',np.nan).astype(float)
+        df_master_asins['asin_price_usd'] = df_master_asins.asin_price_usd.replace('',np.nan).astype(float)
+        df_master_asins['asin_daily_sales_frequency'] = df_master_asins.asin_daily_sales_frequency.replace('',np.nan).astype(float)
+        df_master_asins['asin_launch_date'] = df_master_asins.asin_launch_date.replace('',np.nan).astype('datetime64[ns]')
+        df_master_asins['asin_extraction_timestamp'] = datetime.now().replace(second=0, microsecond=0)
+
+        # CREATING ASIN KEYWORDS COLUMN / DATA POINT
+        df_master_asins['asin_keywords'] = df_master_asins['asin_title'].str.replace('\d+', '')
+        for w, asintitle in enumerate(df_master_asins['asin_keywords']):
+            pwords = ['and', 'for', 'a', 'an', 'is', 'of', 'the', 'but', 'or', 'in', 'that', 'if', 'when', 'than', 'as', 'not', 'with', 'best', 'rated', 'use', 'us', 'sizes', 'set', 'shipping', 'amazon', 'prime', 'small', 'medium', 'large', 'xl', 'xxl', '2xl', 'count', 'from', 'certified', 'hour', 'hours']
+            current_asin = df_master_asins.iloc[w]['asin_keywords']
+            brand = df_master_asins.iloc[w]['asin_brand']
+            brand = brand.lower()
+            brand = brand.replace('-', '- ').replace(',', ', ').replace('&', '& ').replace('#', '# ').replace('w/', ' ').replace('/', ' ').replace(u"\u2122", '').replace(r'[()]', "")
+            brand = list(set(brand.translate(str.maketrans('', '', string.punctuation)).split()))
+            pwords += brand
+            pwords = list(set(pwords))
+            current_asin = current_asin.lower()
+            current_asin = current_asin.replace('-', '- ').replace(',', ', ').replace('&', '& ').replace('#', '# ').replace('w/', ' ').replace('/', ' ').replace(u"\u2122", '').replace(r'[()]', "")
+            current_asin = current_asin.translate(str.maketrans('', '', string.punctuation)).split()
+            current_asin = [v for v in current_asin if len(v) >= 2]
+            akeywords = [aword for aword in current_asin if aword not in pwords]
+            df_master_asins['asin_keywords'][w] = ', '.join(set(akeywords))
+            
+        df_master_asins = df_master_asins.reindex(columns=['ASIN', 'asin_score', 'asin_title', 'asin_keywords', 'asin_price_usd', 'asin_price_range', 'asin_total_ratings', 'asin_avg_rating', 'asin_daily_sales_frequency', 'asin_copywriting', 'asin_details', 'asin_dimensions', 'asin_brand', 'asin_category', 'asin_url', 'asin_image_urls', 'asin_video_urls', 'asin_variants', 'asin_launch_date', 'asin_search_term', 'asin_search_term_pagerank', 'asin_extraction_timestamp'])
+        df_master_asins = df_master_asins.reset_index(drop=True)
+
+        # SETTING MASTER ASINS DATAFRAME COLUMNS TO EXACT SCHEMA OF MASTER ASINS BQ TABLE
+        master_asins_table = client.get_table(gbq_master_asins_table_location)
+        master_asins_table_schema = [{'name':g.name, 'type':g.field_type} for g in master_asins_table.schema]
+        df_master_asins.columns = [g.name for g in master_asins_table.schema]
+
+        # LOADING MASTER ASINS TABLE TO BQ
+        def gbq_load_master_asins(df_master_asins):
+    
+            df_master_asins.to_gbq(destination_table=gbq_master_asins_table_location, project_id=gbq_project_id, table_schema=master_asins_table_schema, if_exists='append')
+
+        gbq_load_master_asins(df_master_asins=df_master_asins)
+        print('MASTER ASINS TABLE TRANSFORMED & LOADED TO BIGQUERY')
+
+        ###################################################################################################################
+
+        # SETTING MANUAL INPUTS
+    #prompt_list = ["neck", "back", "neck relief", "back relief", "shoulder pain", "tooth pain", "hair loss", "weight loss", "bunion", "heel pain", "foot pain", "knee pain", "pet safety", "non slip", "teeth white", "wrinkle", "acne", "humidifier", "healthy", "heart supplement", "ear", "eye irritation", "makeup", "eyelash", "eyebrow", "fitness", "workout", "walk", "jog", "tendon", "supplement", "smoothie", "investing", "bug", "lighting", "solar"]
+    #prompt_list = ["travel", "neck", "back", "arthritis", "safety", "fatigue", "anxiety", "stress", "plant", "gift", "outdoor", "survival", "fire", "camp", "fish", "hunt", "hair", "elbow", "eye", "wallet", "purse", "street", "baby care", "personal care", "interior", "lint", "office", "toys", "sleep", "chair", "table", "painting", "decor", "kitchen", "bathroom", "toilet", "bedding", "bath", "plant", "garden", "lawn", "light", "home", "appliance", "game", "sailing", "water", "pool", "land"]
+    #prompt_list = ["business owners", "business owner book", "business owner scaling", "business tax", "business owner tax", "small business owner", "small business", "business bookkeeping", "small business accounting"]
+    with open('prompt_list.txt', 'r') as file:
+        prompt_list = file.read()
+        prompt_list = prompt_list.replace('\n', ' ').split(",")
+        print(prompt_list)
+    # Starting Separate Full Automation Loops per Prompt
+    #master_tables = []
+    prompt_list = [[u] for u in prompt_list]
+    for j, prompt in enumerate(prompt_list):
+        auto_search_term_list = prompt
+        try:
+            df_updated_master_asins = getMasterASINS(auto_search_term_list)
+            print('Completed Master ASINS Automation Loop Number:', j+1)
+        except:
+            print('Passing on Master ASINS Automation Loop Number:', j+1, 'Due to Exception')
+            pass
+        #master_tables.append(df_master_table)
+    #all_master_tables = pd.concat(master_tables)
+    print('ALL MASTER ASINS LOOPS SUCCESSFULLY COMPLETED')
+    #all_master_tables
+if __name__ == "__main__":
+    main()
